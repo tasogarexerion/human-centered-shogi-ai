@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========= User toggles =========
+TASO_SHOW="${TASO_SHOW:-0}"
+TASO_MIRACLE="${TASO_MIRACLE:-0}"
+TASO_LOG="${TASO_LOG:-1}"
+TASO_DEBUG="${TASO_DEBUG:-0}"   # 1でstderr詳細表示
+
+PREFLIGHT_MS="${PREFLIGHT_MS:-30}"
+
+# ========= Paths =========
+DL="$HOME/shogi/engines/dlshogi/build/dlshogi"
+DL_MODEL="$HOME/shogi/models/dlshogi_model/model.onnx"
+HUMAN_AI="$HOME/shogi/humanscore_ai/infer.py"
+HUMAN_PY="$HOME/shogi/.venv/bin/python"
+
+DL_THREADS="${DL_THREADS:-10}"
+MULTIPV="${MULTIPV:-5}"
+PREFLIGHT_THREADS="${PREFLIGHT_THREADS:-2}"
+PREFLIGHT_MULTIPV="${PREFLIGHT_MULTIPV:-3}"
+
+# ========= SUDDEN DEATH =========
+### SUDDEN DEATH ADDITION ###
+SUDDEN_DEATH_MODE=0
+TASO_SD_MPV_MIN="${TASO_SD_MPV_MIN:-2}"
+TASO_SD_MPV_MAX="${TASO_SD_MPV_MAX:-3}"
+TASO_SD_SCORE_LIMIT="${TASO_SD_SCORE_LIMIT:--600}"
+declare -A PV_MOVES
+### SUDDEN DEATH ADDITION ###
+
+# ========= State =========
+CURRENT_POS=""
+MOVE_COUNT=0
+LAST_SCORE=0
+LAST_MATE=0
+
+# ========= UI =========
+say() { [ "$TASO_SHOW" = "1" ] && echo "info string $*"; }
+dbg() { [ "$TASO_DEBUG" = "1" ] && echo "[DEBUG] $*" >&2; }
+
+# ========= Engine PIDs =========
+DL_PID=""
+PF_PID=""
+YN_PID=""
+
+# ========= Safe cleanup =========
+cleanup() {
+  dbg "cleanup start"
+  [ -n "$DL_PID" ] && kill "$DL_PID" 2>/dev/null || true
+  [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null || true
+  [ -n "$YN_PID" ] && kill "$YN_PID" 2>/dev/null || true
+  dbg "cleanup done"
+}
+trap cleanup EXIT INT TERM
+
+# ========= Dummy USI mode =========
+DUMMY_MODE=0
+if [ ! -x "$DL" ] || [ ! -f "$DL_MODEL" ]; then
+  DUMMY_MODE=1
+  dbg "dlshogi or model missing -> dummy USI mode"
+fi
+
+# ========= Start engines =========
+if [ "$DUMMY_MODE" = "0" ]; then
+  coproc DL_ENG { "$DL" --device metal --model "$DL_MODEL" --threads "$DL_THREADS" --multipv "$MULTIPV"; }
+  DL_PID=$!
+  exec 3>&"${DL_ENG[1]}" 4<"${DL_ENG[0]}"
+
+  coproc PF_ENG { "$DL" --device metal --model "$DL_MODEL" --threads "$PREFLIGHT_THREADS" --multipv "$PREFLIGHT_MULTIPV"; }
+  PF_PID=$!
+  exec 7>&"${PF_ENG[1]}" 8<"${PF_ENG[0]}"
+else
+  exec 3>/dev/null 4</dev/null
+  exec 7>/dev/null 8</dev/null
+fi
+
+# ========= Helpers =========
+read_until_token() {
+  local fd="$1" token="$2" line
+  while IFS= read -r line <&"$fd"; do
+    [[ "$line" == "$token"* ]] && break
+  done
+}
+
+mate_num() {
+  [[ "$1" =~ ^-?[0-9]+$ ]] && echo "$1" || echo "0"
+}
+
+# ========= Main loop =========
+while IFS= read -r line; do
+  dbg "IN: $line"
+
+  if [[ "$line" == quit* ]]; then
+    echo "quit" >&3 || true
+    echo "quit" >&7 || true
+    exit 0
+  fi
+
+  if [[ "$line" == usi* ]]; then
+    if [ "$DUMMY_MODE" = "1" ]; then
+      echo "id name TASO (ERROR: dlshogi missing)"
+      echo "id author TASO"
+      echo "usiok"
+    else
+      echo "$line" >&3
+      read_until_token 4 "usiok"
+      echo "usiok"
+    fi
+    continue
+  fi
+
+  if [[ "$line" == isready* ]]; then
+    if [ "$DUMMY_MODE" = "1" ]; then
+      echo "readyok"
+    else
+      echo "$line" >&3
+      read_until_token 4 "readyok"
+      echo "readyok"
+    fi
+    continue
+  fi
+
+  if [[ "$line" == position* ]]; then
+    CURRENT_POS="${line#position }"
+    MOVE_COUNT="$(echo "$line" | awk '{for(i=1;i<=NF;i++)if($i=="moves"){print NF-i;exit}print 0}')"
+    [ "$DUMMY_MODE" = "0" ] && echo "$line" >&3
+    continue
+  fi
+
+  if [[ "$line" == go* ]]; then
+    if [ "$DUMMY_MODE" = "1" ]; then
+      say "❌ dlshogi/model.onnx not found"
+      echo "bestmove resign"
+      continue
+    fi
+
+    say "🧠 TASO thinking..."
+    echo "$line" >&3
+
+    while IFS= read -r out <&4; do
+      dbg "ENG: $out"
+      if [[ "$out" == bestmove* ]]; then
+        echo "$out"
+        break
+      fi
+      echo "$out"
+    done
+    continue
+  fi
+
+  [ "$DUMMY_MODE" = "0" ] && echo "$line" >&3
+done
