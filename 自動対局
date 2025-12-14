@@ -1,0 +1,39 @@
+cat > ~/shogi/tools/auto_learn.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+VENV="$HOME/shogi/.venv"
+PY="$VENV/bin/python"
+
+SELFPLAY="$HOME/shogi/tools/selfplay.sh"
+GEN="$HOME/shogi/tools/generate_bunker_dataset.py"
+TRAIN="$HOME/shogi/humanscore_ai/train.py"
+
+LOOPS="${1:-10}"          # 学習ループ回数
+GAMES_PER_LOOP="${2:-50}" # 1ループの自己対局数
+GEN_GAMES="${3:-100}"     # 崖局面生成数
+
+source "$VENV/bin/activate"
+
+for i in $(seq 1 "$LOOPS"); do
+  echo "=============================="
+  echo " 🔁 LOOP $i / $LOOPS"
+  echo "=============================="
+
+  echo "▶ Self-play ($GAMES_PER_LOOP games)"
+  bash "$SELFPLAY" "$GAMES_PER_LOOP"
+
+  echo "▶ Generate bunker dataset ($GEN_GAMES games)"
+  "$PY" "$GEN" "$GEN_GAMES"
+
+  if [ -f "$TRAIN" ]; then
+    echo "▶ Train HumanScore"
+    "$PY" "$TRAIN"
+  else
+    echo "⚠ train.py not found, skip training"
+  fi
+
+  echo "✅ LOOP $i DONE"
+done
+SH
+chmod +x ~/shogi/tools/auto_learn.sh
