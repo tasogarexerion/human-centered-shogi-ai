@@ -1,0 +1,57 @@
+bash -lc 'set -euo pipefail
+
+ENGINE="$HOME/shogi/wrapper/taso_engine.sh"
+
+echo "=== TASO SUDDEN DEATH REAL MOVE PICK PATCH ==="
+
+# ============================================================
+# 1) PVバッファ用の配列を追加（削除ゼロ）
+# ============================================================
+grep -q "PV_BUFFER_INIT" "$ENGINE" || sed -i "" "/^LAST_MATE=0/a\\
+\\
+### SUDDEN DEATH ADDITION (PV BUFFER) ###\\
+declare -A PV_MOVES\\
+### SUDDEN DEATH ADDITION ###\\
+" "$ENGINE"
+
+# ============================================================
+# 2) info行から multipv と pv を保存
+# ============================================================
+grep -q "PV_BUFFER_CAPTURE" "$ENGINE" || sed -i "" "/if \\[\\[ \"\\\$out\" == info\\* \\]\\]; then/a\\
+\\
+### SUDDEN DEATH ADDITION (PV BUFFER CAPTURE) ###\\
+if echo \"\\\$out\" | grep -q \" multipv \"; then\\
+  mpv=\\\$(echo \"\\\$out\" | awk \"{for(i=1;i<=NF;i++) if(\\\$i==\\\\\\\"multipv\\\\\\\"){print \\\$(i+1); exit}}\")\\
+  pv=\\\$(echo \"\\\$out\" | sed \"s/.* pv //\" | awk \"{print \\\$1}\")\\
+  [ -n \"\\\$mpv\" ] && [ -n \"\\\$pv\" ] && PV_MOVES[\\\$mpv]=\\\$pv\\
+fi\\
+### SUDDEN DEATH ADDITION ###\\
+" "$ENGINE"
+
+# ============================================================
+# 3) bestmove を差し替える処理
+# ============================================================
+grep -q "SUDDEN_DEATH_PICK" "$ENGINE" || sed -i "" "/if \\[\\[ \"\\\$out\" == bestmove\\* \\]\\]; then/a\\
+\\
+### SUDDEN DEATH ADDITION (REAL PICK) ###\\
+if [ \"\\\$SUDDEN_DEATH_MODE\" = \"1\" ]; then\\
+  min=\\\${TASO_SD_MPV_MIN:-2}\\
+  max=\\\${TASO_SD_MPV_MAX:-3}\\
+  choices=()\\
+  for i in \\\$(seq \\\$min \\\$max); do\\
+    [ -n \"\\\${PV_MOVES[\\\$i]:-}\" ] && choices+=(\"\\\${PV_MOVES[\\\$i]}\")\\
+  done\\
+  if [ \\\${#choices[@]} -gt 0 ]; then\\
+    pick=\\\${choices[\\\$((RANDOM % \\\${#choices[@]}))]}\\
+    echo \"bestmove \\\$pick\"\\
+    PV_MOVES=()\\
+    continue\\
+  fi\\
+fi\\
+PV_MOVES=()\\
+### SUDDEN DEATH ADDITION ###\\
+" "$ENGINE"
+
+chmod +x "$ENGINE"
+echo "✅ REAL SUDDEN DEATH MOVE PICK ENABLED"
+'
