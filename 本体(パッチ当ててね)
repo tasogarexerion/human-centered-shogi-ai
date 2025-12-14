@@ -1,5 +1,3 @@
-更新版
-
 bash -lc 'set -euo pipefail
 
 echo "=== TASO one-shot Mac installer (prototype, honest & reproducible) ==="
