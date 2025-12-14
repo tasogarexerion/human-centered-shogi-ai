@@ -1,162 +1,179 @@
-# Human-Centered Shogi AI
+TASO – Human-Oriented Shogi Engine Wrapper
 
-**Human-centered shogi AI wrapper for amateur players**
+TASO is not a stronger shogi engine.
+TASO is an engine that wins the way humans lose.
 
-⚠️ **This is a research prototype (work in progress).**
+⸻
 
----
+Overview
 
-## Overview
+TASO is a wrapper-based shogi AI framework designed to explore
+how humans actually lose winning positions.
 
-This repository contains an experimental shogi AI system designed to make
-**strong existing shogi engines usable for amateur players**.
+Instead of always selecting the objectively strongest move,
+TASO dynamically chooses between:
+	•	Safe conversion (winning without risk)
+	•	Pressure play (forcing difficult decisions)
+	•	Comeback / sudden-death attempts when losing
 
-Instead of improving engine strength itself, this project focuses on:
+The core idea is simple:
 
-- Translating strong AI decisions into **human-executable strategies**
-- Reducing typical human errors around winning and losing positions
-- Supporting *how humans actually play*, not how AIs play
+In real games, humans do not lose because a position is lost.
+They lose because they make mistakes under pressure.
 
-The system acts as a **wrapper layer** on top of existing engines such as
-dlshogi and YaneuraOu.
+TASO is built to model and exploit that pressure.
 
----
+⸻
 
-## Core Concept
+What This Repository Contains
 
-> **Do not make AI stronger.  
-> Make strong AI usable by humans.**
+This repository provides only original code written for TASO:
+	•	USI-compatible engine wrapper (taso_engine.sh)
+	•	Position / dataset generator for “bunker” (cliff-edge) situations
+	•	Scripts for self-play and automated data generation
+	•	Diagnostic tools (doctor.sh)
 
-Modern shogi engines already surpass human performance.
-However, many amateur players struggle because:
+What This Repository Does NOT Contain
 
-- Best moves are hard to understand or reproduce
-- Winning positions collapse due to a single mistake
-- Defensive or comeback strategies are unclear
+To avoid license and redistribution issues, this repository does NOT include:
+	•	Any shogi engine binaries (e.g. dlshogi, YaneuraOu)
+	•	Any neural network model files (e.g. model.onnx)
+	•	Any third-party evaluation code
 
-This project introduces a lightweight decision-support layer called
-**HumanScore AI**, which estimates:
+You must obtain and place those components yourself.
 
-> *How likely a human player can continue playing accurately
-> in the current position.*
+⸻
 
-Based on this estimate, the AI adapts its behavior and explanations.
+External Dependencies (User-Provided)
 
----
+TASO expects the following external components to be installed separately:
+	•	dlshogi (engine binary)
+	•	dlshogi neural network model (model.onnx)
+	•	(Optional) YaneuraOu (used for forced mate / endgame conversion)
 
-## Key Features
+Each of these components is subject to its own license.
+Users are responsible for complying with the respective licenses.
 
-### 🧠 HumanScore AI
-- Estimates *human playability*, not position strength
-- Outputs a value between `0.0 – 1.0`
-- Used only to **guide decision selection**, not search itself
+This repository does not redistribute them.
 
-### 🛡 / ⚖ / 🔥 Strategy Modes
-The system explicitly shows the current strategic intent:
+⸻
 
-- 🛡 **Defend to win** – stable winning positions
-- ⚖ **Balance** – unclear or transitional positions
-- 🔥 **Attack to win** – unstable or no-safe-defense positions
+Design Philosophy
 
-### 🏖 Bunker (Cliff) Position Detection
-Detects positions where:
-- Evaluation looks good
-- One wrong move causes collapse
+1. Human-Centered Evaluation
 
-These are highlighted as **high-risk human error zones**.
+TASO introduces a concept called HumanScore,
+which estimates how difficult a position is for a human to handle,
+even if it is objectively winning or losing.
 
-### ☠️ Comeback & Sudden Death Modes
-When losing:
-- Prioritizes positions where the opponent is likely to fail
-- Allows controlled deviation from strict best-move play
-- Focuses on *practical* rather than theoretical survival
+Examples of factors:
+	•	Evaluation spread between best and second-best moves
+	•	Low number of safe legal moves
+	•	Volatility of evaluation over short sequences
+	•	Delayed collapse after an inaccuracy
 
-### 🔄 Automatic Self-Play & Learning
-- Self-play detects human-error-prone positions
-- Generates lightweight training data automatically
-- Updates HumanScore AI without retraining engines
+⸻
 
----
+2. Bunker (Cliff-Edge) Positions
 
-## What This Project Is NOT
+A bunker position is defined as:
 
-- ❌ Not an AI-vs-AI competition engine
-- ❌ Not designed for Denryusen or Elo benchmarking
-- ❌ Not a replacement for existing shogi engines
+A position that is still objectively playable,
+but where one mistake immediately collapses the game.
 
-This project intentionally sacrifices theoretical optimality
-for **practical human usability**.
+TASO automatically detects and records such positions
+to build training datasets focused on human error patterns,
+not perfect play.
 
----
+⸻
 
-## Target Users
+3. Attack / Defense Switching
 
-- Amateur shogi players (around 1-dan level)
-- Developers interested in human-centered AI design
-- Researchers exploring explainable or assistive AI systems
+TASO dynamically switches its behavior based on estimated human difficulty:
+	•	“Attack to win” – increase pressure and complexity
+	•	“Defend to win” – reduce risk and simplify
+	•	Balanced – when neither extreme is optimal
 
----
+This is not randomness —
+it is policy switching based on human vulnerability.
 
-## Repository Structure
-├── 本体/              # Core engine wrapper
-├── 自動対局/          # Self-play and data generation
-├── 頓死筋モード/      # Sudden-death / comeback logic
-└── README.md
-Each directory is designed to be readable and modifiable independently.
+⸻
 
----
+4. Comeback & Sudden Death Modes
 
-## Usage (Conceptual)
+When objectively losing, TASO does not resign immediately.
 
-This system works as a **USI-compatible wrapper**.
+Instead it may:
+	•	Attempt accident-inducing play
+	•	Enter Sudden Death mode, deliberately choosing
+non-optimal but dangerous variations from multi-PV candidates
 
-Typical flow:
+This reflects real-world competitive play,
+where the goal is not correctness, but survival.
 
-1. Existing engine performs normal search
-2. Lightweight preflight analysis extracts key indicators
-3. HumanScore AI estimates human playability
-4. Strategy mode is selected and displayed
-5. Final move is chosen from acceptable candidates
+⸻
 
-Detailed setup instructions will be added incrementally.
+Dataset Generation
 
----
+The included dataset generator produces JSON files describing:
+	•	Board position (USI startpos moves ...)
+	•	Evaluation metrics (normalized to Black’s perspective)
+	•	Volatility and pressure indicators
+	•	Estimated collapse probability
 
-## Article (Design Explanation)
+These datasets are intended for:
+	•	Training HumanScore models
+	•	Analyzing where humans most frequently fail
+	•	Research and experimentation
 
-Design philosophy and detailed explanation (Japanese):
+They are not ground truth labels.
 
-👉 https://note.com/（ここにあなたの記事URL）
+⸻
 
-The article is written in a *paper-style technical essay format*.
+Reproducibility & Limitations
+	•	Evaluation values depend heavily on engine, model, hardware, and time limits
+	•	Generated datasets are noisy by design
+	•	TASO does not aim for perfect reproducibility across systems
 
----
+This project prioritizes behavioral realism over theoretical optimality.
 
-## Status
+⸻
 
-- Experimental / research prototype
-- Actively evolving
-- Interfaces and parameters may change
+Intended Use
 
-Feedback and discussion are welcome.
+TASO is intended for:
+	•	Research into human error in shogi
+	•	Experimental AI behavior design
+	•	Educational and analytical purposes
 
----
+It is not intended for:
+	•	Competitive rating benchmarks
+	•	Claims of engine strength
+	•	Cheating in online play
 
-## License
+⸻
 
-Copyright (c) 2025 tasogarexerion
+License
 
-This code is released **free of charge for research and educational use**.  
-Commercial use requires permission from the author.
+All original code in this repository is released under the MIT License
+(unless stated otherwise in individual files).
 
----
+Third-party engines and models are not covered by this license.
 
-## Closing Note
+⸻
 
-This project explores a simple idea:
+Disclaimer
 
-> **AI should not only be strong.  
-> AI should be usable by humans.**
+This project is an experimental research tool.
+	•	No guarantees of strength, correctness, or stability
+	•	No liability for misuse
+	•	Use at your own risk
 
-If this repository helps stimulate discussion about
-human-centered AI design, it has already succeeded.
+⸻
+
+Acknowledgements
+
+This project is inspired by the idea that:
+
+The most interesting mistakes are not made by weak players,
+but by strong players under pressure.
