@@ -1,5 +1,9 @@
 TASO – Human-Oriented Shogi Engine Wrapper
 
+本リポジトリは将棋AI研究・実験目的のコードです。
+dlshogi本体および学習済みモデルは含まれておらず、
+各自でライセンスを確認の上、用意してください。
+
 TASO is not a stronger shogi engine.
 TASO is an engine that wins the way humans lose.
 
