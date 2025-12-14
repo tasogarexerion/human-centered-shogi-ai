@@ -21,12 +21,14 @@ designed to make strong shogi engines usable for amateur players.
 
 ⚠️ This is a work-in-progress research prototype.
 
-## License
-
-This code is released for free, non-commercial use.
-(Details to be finalized.)
 
 ## Article
 
 Design details are explained in the accompanying article:
 👉 (noteリンクを後で貼る)
+## License
+
+Copyright (c) 2025 <your たそ>
+
+This code is provided free of charge for research and educational use.
+Commercial use requires permission from the author.
