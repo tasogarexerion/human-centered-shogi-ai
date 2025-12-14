@@ -1,0 +1,55 @@
+bash -lc 'set -euo pipefail
+
+FILE="$HOME/shogi/tools/generate_bunker_dataset.py"
+
+echo "=== TASO CP PATH NORMALIZATION PATCH ==="
+
+# ============================================================
+# 1) 正規化関数を追加（削除ゼロ）
+# ============================================================
+grep -q "CP_VIEW_NORMALIZATION" "$FILE" || sed -i "" "/CP_CLIP = 2000.0/a\\
+\\
+### CP_VIEW_NORMALIZATION ADDITION ###\\
+def normalize_cp(cp: float, board: shogi.Board) -> float:\\
+    \\\"\\\"\\\"\\
+    評価値を先手視点に正規化する\\
+    - 先手番: そのまま\\
+    - 後手番: 符号反転\\
+    \\\"\\\"\\\"\\
+    try:\\
+        return float(cp) if board.turn == shogi.BLACK else -float(cp)\\
+    except:\\
+        return float(cp)\\
+### CP_VIEW_NORMALIZATION ADDITION ###\\
+" "$FILE"
+
+# ============================================================
+# 2) cp1 / cp2 / cp_path への反映
+# ============================================================
+grep -q "NORMALIZE_CP_APPLIED" "$FILE" || sed -i "" "/cp1, cp2, spread = pf/a\\
+\\
+### CP_VIEW_NORMALIZATION APPLIED ###\\
+cp1 = normalize_cp(cp1, board)\\
+cp2 = normalize_cp(cp2, board)\\
+spread = cp1 - cp2\\
+### CP_VIEW_NORMALIZATION APPLIED ###\\
+" "$FILE"
+
+grep -q "NORMALIZE_CP_PATH" "$FILE" || sed -i "" "/\"cp_path\": \\[int(cp1)\\]/c\\
+\\
+### CP_VIEW_NORMALIZATION APPLIED ###\\
+\"cp_path\": [int(cp1)],\\
+### CP_VIEW_NORMALIZATION APPLIED ###\\
+" "$FILE"
+
+grep -q "NORMALIZE_CP_FOLLOW" "$FILE" || sed -i "" "/cp_now = pf_now\\[0\\]/a\\
+\\
+### CP_VIEW_NORMALIZATION APPLIED ###\\
+cp_now = normalize_cp(cp_now, board)\\
+### CP_VIEW_NORMALIZATION APPLIED ###\\
+" "$FILE"
+
+chmod +x "$FILE"
+
+echo "✅ CP PATH NORMALIZED (fixed viewpoint volatility)"
+'
