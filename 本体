@@ -1,0 +1,603 @@
+bash -lc 'set -euo pipefail
+
+# ========= Paths =========
+VENV="$HOME/shogi/.venv"
+PY="$VENV/bin/python"
+mkdir -p "$HOME/shogi"/{wrapper,humanscore_ai,tools,data/bunker_positions,taso_joseki}
+
+if [ ! -x "$PY" ]; then
+  echo "ERROR: venv not found at $VENV. (先に一撃インストールでvenv作成してね)"
+  exit 1
+fi
+
+# ============================================================
+# 1) generate_bunker_dataset.py (pressure教師:観測強化 / collapse強化)
+# ============================================================
+cat > ~/shogi/tools/generate_bunker_dataset.py <<'"'"'PY'"'"'
+#!/usr/bin/env python3
+import os, sys, subprocess, random, json
+import shogi
+
+DL = os.path.expanduser("~/shogi/engines/dlshogi/build/dlshogi")
+DL_MODEL = os.path.expanduser("~/shogi/models/dlshogi_model/model.onnx")
+
+OUT_DIR = os.path.expanduser("~/shogi/data/bunker_positions")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+GAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+
+MOVETIME = int(os.environ.get("TASO_GEN_MOVETIME_MS", "40"))
+PREFLIGHT = int(os.environ.get("TASO_GEN_PREFLIGHT_MS", "30"))
+MULTIPV = int(os.environ.get("TASO_GEN_MULTIPV", "5"))
+TOPK = int(os.environ.get("TASO_GEN_TOPK", "2"))
+MAX_PLIES = int(os.environ.get("TASO_GEN_MAX_PLIES", "240"))
+
+BUNKER_SPREAD = int(os.environ.get("TASO_BUNKER_SPREAD", "300"))
+FOLLOW_PLIES = int(os.environ.get("TASO_FOLLOW_PLIES", "6"))
+
+CP_CLIP = 2000.0
+SP_CLIP = 800.0
+
+def clip01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+def start_engine():
+    if not (os.path.exists(DL) and os.path.exists(DL_MODEL)):
+        raise RuntimeError("dlshogi or model.onnx missing")
+    p = subprocess.Popen(
+        [DL, "--model", DL_MODEL, "--device", "metal", "--threads", "8", "--multipv", str(MULTIPV)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
+    )
+    def send(cmd):
+        p.stdin.write(cmd + "\n"); p.stdin.flush()
+    def read_until(tok):
+        while True:
+            l = p.stdout.readline()
+            if not l: raise RuntimeError("engine died")
+            if l.strip().startswith(tok): return
+    send("usi"); read_until("usiok")
+    send("isready"); read_until("readyok")
+    return p, send
+
+def preflight(send, proc, pos_cmd):
+    send(pos_cmd)
+    send(f"go movetime {PREFLIGHT}")
+    cp1 = cp2 = None
+    while True:
+        l = proc.stdout.readline()
+        if not l: break
+        l = l.strip()
+        if l.startswith("info") and "score cp" in l:
+            parts = l.split()
+            try:
+                mpv = int(parts[parts.index("multipv")+1]) if "multipv" in parts else 1
+                cp = int(parts[parts.index("cp")+1])
+                if mpv == 1: cp1 = cp
+                if mpv == 2: cp2 = cp
+            except:
+                pass
+        if l.startswith("bestmove"):
+            break
+    if cp1 is None or cp2 is None:
+        return None
+    return cp1, cp2, cp1 - cp2
+
+def bestmove_with_rank(send, proc, pos_cmd):
+    send(pos_cmd)
+    send(f"go movetime {MOVETIME}")
+    pv = []
+    while True:
+        l = proc.stdout.readline()
+        if not l: break
+        l = l.strip()
+        if l.startswith("info") and " pv " in l and "score cp" in l:
+            parts = l.split()
+            try:
+                mpv = int(parts[parts.index("multipv")+1]) if "multipv" in parts else 1
+                mv = parts[parts.index("pv")+1]
+                pv.append((mpv, mv))
+            except:
+                pass
+        if l.startswith("bestmove"):
+            break
+    pv = sorted(set(pv), key=lambda x: x[0])
+    if not pv:
+        return None, 99
+    k = min(TOPK, len(pv))
+    idx = random.randint(0, k-1)
+    return pv[idx][1], pv[idx][0]  # move, rank
+
+def pressure_teacher(cp1: float, spread: float, legal_moves: int, cp_path):
+    """
+    pressure教師（0..1）
+    改良点：観測成分（FOLLOW区間の評価レンジ=volatility）を必ず使う
+    """
+    bunker = clip01(abs(spread) / SP_CLIP)
+
+    lm = max(1, int(legal_moves))
+    low_escape = clip01((25 - lm) / 20.0)
+
+    vol = 0.0
+    if cp_path:
+        mx, mn = max(cp_path), min(cp_path)
+        vol = clip01((mx - mn) / 800.0)
+
+    prominence = clip01(abs(spread) / (abs(cp1) + 400.0))
+
+    # 観測(vol)の比重を上げて「式の丸暗記」になりにくくする
+    p = 0.38*bunker + 0.22*low_escape + 0.28*vol + 0.12*prominence
+    return clip01(p), bunker, vol, prominence, low_escape
+
+def collapse_teacher(cp_before, cp_after, spread, chosen_rank, follow_plies, vol, pressure):
+    flip = 0.0
+    if cp_before > 300 and cp_after < 100:
+        flip = 1.0
+    elif cp_before > 200 and cp_after < cp_before - 400:
+        flip = 0.7
+
+    bunker_pressure = clip01(abs(spread) / SP_CLIP)
+    rank_penalty = clip01((int(chosen_rank) - 1) / 3.0)
+    delay_bonus = clip01(follow_plies / 6.0)
+
+    score = (
+        0.40*flip +
+        0.20*bunker_pressure*rank_penalty +
+        0.16*delay_bonus +
+        0.10*bunker_pressure +
+        0.08*vol +
+        0.06*pressure
+    )
+    return clip01(score)
+
+def main():
+    proc, send = start_engine()
+    saved = 0
+
+    for g in range(GAMES):
+        board = shogi.Board()
+        moves = []
+        candidates = []
+
+        for ply in range(MAX_PLIES):
+            if board.is_game_over():
+                break
+
+            pos = "position startpos moves " + " ".join(moves) if moves else "position startpos"
+
+            pf = preflight(send, proc, pos)
+            if pf:
+                cp1, cp2, spread = pf
+                if spread >= BUNKER_SPREAD:
+                    candidates.append({
+                        "ply": ply,
+                        "position": "startpos moves " + " ".join(moves),
+                        "cp1": int(cp1),
+                        "cp2": int(cp2),
+                        "spread": int(spread),
+                        "chosen_rank": None,
+                        "legal_moves": len(list(board.legal_moves)),
+                        "cp_path": [int(cp1)],
+                    })
+
+            mv, rank = bestmove_with_rank(send, proc, pos)
+            if not mv or mv == "resign":
+                break
+            try:
+                board.push_usi(mv)
+            except:
+                break
+            moves.append(mv)
+
+            for c in candidates:
+                if c["ply"] == ply and c["chosen_rank"] is None:
+                    c["chosen_rank"] = int(rank)
+
+            new_pos = "position startpos moves " + " ".join(moves)
+            pf_now = preflight(send, proc, new_pos)
+            cp_now = pf_now[0] if pf_now else None
+            if cp_now is not None:
+                for c in candidates:
+                    c["cp_path"].append(int(cp_now))
+
+            for c in candidates[:]:
+                follow = ply - c["ply"]
+                if follow >= FOLLOW_PLIES:
+                    cp_after = c["cp_path"][-1] if c["cp_path"] else c["cp1"]
+
+                    pressure, bunker, vol, prom, low_escape = pressure_teacher(
+                        cp1=float(c["cp1"]),
+                        spread=float(c["spread"]),
+                        legal_moves=int(c["legal_moves"]),
+                        cp_path=c["cp_path"]
+                    )
+
+                    chosen_rank = int(c["chosen_rank"] or 1)
+                    collapse = collapse_teacher(
+                        cp_before=float(c["cp1"]),
+                        cp_after=float(cp_after),
+                        spread=float(c["spread"]),
+                        chosen_rank=chosen_rank,
+                        follow_plies=follow,
+                        vol=float(vol),
+                        pressure=float(pressure),
+                    )
+
+                    out = dict(c)
+                    out["volatility"] = round(float(vol), 3)
+                    out["prominence"] = round(float(prom), 3)
+                    out["low_escape"] = round(float(low_escape), 3)
+                    out["bunker"] = round(float(bunker), 3)
+                    out["pressure"] = round(float(pressure), 3)
+                    out["collapse"] = round(float(collapse), 3)
+
+                    fn = f"bunker_{g}_{c['ply']}.json"
+                    with open(os.path.join(OUT_DIR, fn), "w") as f:
+                        json.dump(out, f, ensure_ascii=False, indent=2)
+                    saved += 1
+                    candidates.remove(c)
+
+        print(f"[game {g+1}/{GAMES}] saved_total={saved}")
+
+    proc.kill()
+    print("DONE. saved_total=", saved)
+
+if __name__ == "__main__":
+    main()
+PY
+chmod +x ~/shogi/tools/generate_bunker_dataset.py
+
+# ============================================================
+# 2) taso_engine.sh (フル機能 + 4点改善)
+#    - プリフライト用DLを別プロセスに分離
+#    - multipv1の“最新(depth最大)”のみ採用
+#    - python3撤廃(venv pythonに統一)
+#    - MOVE_COUNTの数え方修正
+#    - YaneuraOu候補をusiok返るまで自動試行
+# ============================================================
+cat > ~/shogi/wrapper/taso_engine.sh <<'"'"'SH'"'"'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ========= User toggles =========
+TASO_SHOW="${TASO_SHOW:-0}"        # 1でUI表示
+TASO_MIRACLE="${TASO_MIRACLE:-0}"  # 1で詰み見えても粘る
+TASO_LOG="${TASO_LOG:-1}"
+
+# プリフライト（HumanScore用）
+PREFLIGHT_MS="${PREFLIGHT_MS:-30}"   # 20–50ms 推奨
+
+# ========= Paths =========
+DL="$HOME/shogi/engines/dlshogi/build/dlshogi"
+DL_MODEL="$HOME/shogi/models/dlshogi_model/model.onnx"
+HUMAN_AI="$HOME/shogi/humanscore_ai/infer.py"
+HUMAN_PY="$HOME/shogi/.venv/bin/python"
+
+DL_THREADS="${DL_THREADS:-10}"
+MULTIPV="${MULTIPV:-5}"
+PREFLIGHT_THREADS="${PREFLIGHT_THREADS:-2}"
+PREFLIGHT_MULTIPV="${PREFLIGHT_MULTIPV:-2}"
+
+# ========= State =========
+CURRENT_POS=""
+MOVE_COUNT=0
+LAST_SCORE=0
+LAST_MATE=0
+
+# ========= UI helpers =========
+say() { [ "$TASO_SHOW" = "1" ] && echo "info string $*"; }
+
+# ========= HumanScore =========
+get_hws() {
+  local cp="${1:-0}"
+  local spread="${2:-0}"
+  if [ -n "$CURRENT_POS" ] && [ -f "$HUMAN_AI" ]; then
+    "$HUMAN_PY" "$HUMAN_AI" "$CURRENT_POS" "$cp" "$spread" 2>/dev/null || echo "0.50"
+  else
+    echo "0.50"
+  fi
+}
+
+# ========= バンカー判定 =========
+bunker_flag() {
+  local cp1="${1:-0}" cp2="${2:-0}"
+  local spread=$(( cp1 - cp2 ))
+  local bunker=0
+  if [ "$spread" -ge 300 ] && [ "$cp1" -ge -800 ] && [ "$cp1" -le 800 ]; then
+    bunker=1
+  fi
+  echo "$bunker $spread"
+}
+
+# ========= Yaneura binary pick (usiok返るまで試す) =========
+pick_yane() {
+  local cand
+  while IFS= read -r cand; do
+    [ -x "$cand" ] || continue
+    if echo -e "usi\nquit\n" | "$cand" 2>/dev/null | grep -q "^usiok"; then
+      echo "$cand"
+      return 0
+    fi
+  done < <(find "$HOME/shogi/engines/YaneuraOu/source" -maxdepth 2 -type f -perm -111 -name "YaneuraOu*" 2>/dev/null || true)
+
+  echo ""
+  return 1
+}
+YANE_BIN="$(pick_yane || true)"
+
+# ========= Start engines =========
+# Main DL engine (full analysis)
+coproc DL_ENG { "$DL" --device metal --model "$DL_MODEL" --threads "$DL_THREADS" --multipv "$MULTIPV"; }
+exec 3>&"${DL_ENG[1]}"; exec 4<"${DL_ENG[0]}"
+
+# Preflight DL engine (separate to avoid stream contention)
+coproc PF_ENG { "$DL" --device metal --model "$DL_MODEL" --threads "$PREFLIGHT_THREADS" --multipv "$PREFLIGHT_MULTIPV"; }
+exec 7>&"${PF_ENG[1]}"; exec 8<"${PF_ENG[0]}"
+
+# Yaneura engine (optional)
+if [ -n "${YANE_BIN:-}" ]; then
+  coproc YN_ENG { "$YANE_BIN"; }
+  exec 5>&"${YN_ENG[1]}"; exec 6<"${YN_ENG[0]}"
+else
+  # dummy fds to avoid errors if not present
+  exec 5>/dev/null
+  exec 6</dev/null
+fi
+
+read_until_token() {
+  local fd="$1" token="$2" out
+  while IFS= read -r out <&"$fd"; do
+    echo "$out"
+    [[ "$out" == "$token"* ]] && break
+  done
+}
+
+# ========= Parse latest multipv1 cp/mate by max depth =========
+# Reads engine output until bestmove; tracks max depth line for multipv1.
+pump_until_bestmove_track() {
+  local fd="$1" out
+  local best_depth=-1
+  local best_cp="$LAST_SCORE"
+  local best_mate="$LAST_MATE"
+
+  while IFS= read -r out <&"$fd"; do
+    if [[ "$out" == info* ]]; then
+      # only multipv 1 lines
+      if echo "$out" | grep -q " multipv 1 " ; then
+        # depth
+        local d
+        d="$(echo "$out" | awk '{
+          for(i=1;i<=NF;i++) if($i=="depth"){print $(i+1); exit}
+        }' 2>/dev/null || echo "")"
+        [ -n "$d" ] || d=-1
+
+        # cp/mate
+        if echo "$out" | grep -q "score cp" ; then
+          local cp
+          cp="$(echo "$out" | sed 's/.*score cp //' | awk '{print $1}' 2>/dev/null || echo "")"
+          if [ -n "$cp" ] && [ "$d" -ge "$best_depth" ]; then
+            best_depth="$d"
+            best_cp="$cp"
+          fi
+        fi
+        if echo "$out" | grep -q " mate " ; then
+          local mt
+          mt="$(echo "$out" | sed 's/.*mate //' | awk '{print $1}' 2>/dev/null || echo "")"
+          if [ -n "$mt" ] && [ "$d" -ge "$best_depth" ]; then
+            best_depth="$d"
+            best_mate="$mt"
+          fi
+        fi
+      fi
+
+      echo "$out"
+      continue
+    fi
+
+    echo "$out"
+    if [[ "$out" == bestmove* ]]; then
+      LAST_SCORE="$best_cp"
+      LAST_MATE="$best_mate"
+      break
+    fi
+  done
+}
+
+# ========= Preflight analyze using PF engine =========
+preflight_analyze() {
+  local cp1=0 cp2=0
+  local best_d1=-1 best_d2=-1
+  echo "position $CURRENT_POS" >&7
+  echo "go movetime $PREFLIGHT_MS" >&7
+
+  local out
+  while IFS= read -r out <&8; do
+    if [[ "$out" == info* ]] && echo "$out" | grep -q "score cp"; then
+      # depth
+      local d mpv cp
+      d="$(echo "$out" | awk '{
+        for(i=1;i<=NF;i++) if($i=="depth"){print $(i+1); exit}
+      }' 2>/dev/null || echo "-1")"
+      mpv="$(echo "$out" | awk '{
+        for(i=1;i<=NF;i++) if($i=="multipv"){print $(i+1); exit}
+      }' 2>/dev/null || echo "1")"
+      cp="$(echo "$out" | sed 's/.*score cp //' | awk '{print $1}' 2>/dev/null || echo "")"
+
+      if [ "$mpv" = "1" ] && [ -n "$cp" ] && [ "$d" -ge "$best_d1" ]; then
+        best_d1="$d"; cp1="$cp"
+      fi
+      if [ "$mpv" = "2" ] && [ -n "$cp" ] && [ "$d" -ge "$best_d2" ]; then
+        best_d2="$d"; cp2="$cp"
+      fi
+      continue
+    fi
+    [[ "$out" == bestmove* ]] && break
+  done
+
+  local spread=$(( cp1 - cp2 ))
+  echo "$cp1 $cp2 $spread"
+}
+
+# ========= COMEBACK =========
+emit_comeback() {
+  local score="$1" mate="$2" hws="$3"
+  local limit="-600"
+
+  if [ "$score" -le "$limit" ]; then
+    local type roadmap
+    if [ "$mate" -gt 0 ] && [ "$mate" -le 7 ]; then
+      type="☠⚡ COMEBACK 一撃必殺"
+      roadmap="詰めろ・必至を狙え"
+    else
+      # python3撤廃：venv python使用
+      if "$HUMAN_PY" - <<PY >/dev/null 2>&1
+h=float("$hws"); import sys; sys.exit(0 if h>=0.45 else 1)
+PY
+      then
+        type="☠🎭 COMEBACK 事故誘発"
+        roadmap="受け一択を迫れ"
+      else
+        type="☠🐍 COMEBACK ジワジワ"
+        roadmap="体勢を入れ替える"
+      fi
+    fi
+
+    say "$type"
+    say "▶ $roadmap"
+
+    if [ "$TASO_LOG" = "1" ]; then
+      mkdir -p "$HOME/shogi/taso_joseki"
+      local poshash
+      poshash="$(echo "$CURRENT_POS" | shasum | cut -c1-8)"
+      echo "$(date),$MOVE_COUNT,$score,$hws,$type,$poshash" >> "$HOME/shogi/taso_joseki/comeback_log.csv"
+    fi
+  fi
+}
+
+# ========= 終盤切替（必至優先） =========
+should_switch_to_yane() {
+  # Yaneuraが無いなら切替しない
+  [ -n "${YANE_BIN:-}" ] || return 1
+
+  if [ "${LAST_MATE:-0}" -gt 0 ] && [ "${LAST_MATE:-0}" -le 5 ] && [ "$TASO_MIRACLE" = "0" ]; then
+    return 0
+  fi
+  if [ "$MOVE_COUNT" -ge 90 ]; then return 0; fi
+  if [ "$LAST_SCORE" -ge 2500 ] || [ "$LAST_SCORE" -le -2500 ]; then return 0; fi
+  return 1
+}
+
+# ========= Main loop =========
+while IFS= read -r line; do
+  if [[ "$line" == position* ]]; then
+    CURRENT_POS="${line#position }"
+
+    # MOVE_COUNT: moves 以降の手数だけ数える（moves自体は数えない）
+    MOVE_COUNT="$(
+      echo "$line" | awk '
+        {
+          for(i=1;i<=NF;i++){
+            if($i=="moves"){
+              print (NF - i);
+              exit
+            }
+          }
+          print 0
+        }' 2>/dev/null
+    )"
+  fi
+
+  if [[ "$line" == quit* ]]; then
+    echo "$line" >&3
+    echo "$line" >&7
+    [ -n "${YANE_BIN:-}" ] && echo "$line" >&5 || true
+    exit 0
+  fi
+
+  if [[ "$line" == usi* ]]; then
+    echo "$line" >&3
+    echo "$line" >&7
+    read_until_token 4 "usiok" >/dev/null
+    read_until_token 8 "usiok" >/dev/null
+    if [ -n "${YANE_BIN:-}" ]; then
+      echo "$line" >&5
+      read_until_token 6 "usiok" >/dev/null
+    fi
+    echo "usiok"
+    continue
+  fi
+
+  if [[ "$line" == isready* ]]; then
+    echo "$line" >&3
+    echo "$line" >&7
+    read_until_token 4 "readyok" >/dev/null
+    read_until_token 8 "readyok" >/dev/null
+    if [ -n "${YANE_BIN:-}" ]; then
+      echo "$line" >&5
+      read_until_token 6 "readyok" >/dev/null
+    fi
+    echo "readyok"
+    continue
+  fi
+
+  if [[ "$line" == setoption* ]] || [[ "$line" == usinewgame* ]] || [[ "$line" == position* ]]; then
+    echo "$line" >&3
+    echo "$line" >&7
+    [ -n "${YANE_BIN:-}" ] && echo "$line" >&5 || true
+    continue
+  fi
+
+  if [[ "$line" == go* ]]; then
+    # --- Preflight (separate engine) ---
+    read PF_CP1 PF_CP2 PF_SPREAD < <(preflight_analyze)
+    read BUNKER SPREAD < <(bunker_flag "$PF_CP1" "$PF_CP2")
+
+    HWS="$(get_hws "$PF_CP1" "$PF_SPREAD")"
+
+    if [ "$TASO_SHOW" = "1" ]; then
+      [ "$BUNKER" = "1" ] && say "🏖 バンカー局面（崖=$SPREAD）"
+      say "🧠 人間勝率: $HWS"
+
+      MODE_LINE="$("$HUMAN_PY" - <<PY
+h=float("$HWS")
+print("🛡 受けて勝つ" if h>=0.8 else ("⚖ バランス" if h>=0.6 else "🔥 攻めて勝つ"))
+PY
+)"
+      say "$MODE_LINE"
+    fi
+
+    emit_comeback "$LAST_SCORE" "$LAST_MATE" "$HWS"
+
+    ENGINE="DL"
+    if should_switch_to_yane; then
+      ENGINE="YANE"
+      say "🔄 終盤：必至優先・勝ち切り"
+    fi
+
+    if [ "$ENGINE" = "DL" ]; then
+      echo "$line" >&3
+      pump_until_bestmove_track 4
+    else
+      echo "$line" >&5
+      pump_until_bestmove_track 6
+    fi
+    continue
+  fi
+
+  # default passthrough
+  echo "$line" >&3
+  echo "$line" >&7
+  [ -n "${YANE_BIN:-}" ] && echo "$line" >&5 || true
+done
+SH
+chmod +x ~/shogi/wrapper/taso_engine.sh
+
+echo "✅ patched: generate_bunker_dataset.py + taso_engine.sh"
+echo ""
+echo "次に（おすすめ）:"
+echo "  source ~/shogi/.venv/bin/activate"
+echo "  python ~/shogi/tools/generate_bunker_dataset.py 200"
+echo "  python ~/shogi/humanscore_ai/train.py"
+echo ""
+echo "USI:"
+echo "  ~/shogi/wrapper/taso_engine.sh"
+'
