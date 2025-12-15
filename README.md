@@ -69,6 +69,7 @@ dlshogi → やねうら王 に自動切替
 	•	将棋AIの新しい使い方・思想の検証
 
 ※ 本エンジンは レーティング対局・大会用途 を想定していません。
+
 Copyright (c) 2025 tasogarexerion
 All Rights Reserved.
 
@@ -147,8 +148,10 @@ dlshogi による自己対局から
 	•	勝勢でのミス耐性研究
 	•	HumanScore / FearScore の教師データ生成
 	•	将棋における「心理的難所」の研究
+
 Copyright (c) 2025 tasogarexrion
 All Rights Reserved.
+
 
 •	本ツールおよび生成データは 非商用利用限定 です
 	•	商用利用、データ販売、再配布を禁止します
