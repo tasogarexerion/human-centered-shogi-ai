@@ -107,3 +107,80 @@ All Rights Reserved.
 
 本プロジェクトは研究・個人利用を目的とした思想的試作であり、
 商用利用および再配布は許可されていません。
+
+================================================================
+TASO-Lite Additional License Terms
+================================================================
+
+Copyright (c) 2025 TASO Project
+
+This software, "TASO-Lite", is provided as a human-centered
+Shogi AI proxy for educational, research, and personal use.
+
+----------------------------------------------------------------
+Usage Permission
+----------------------------------------------------------------
+
+Permission is hereby granted to use, copy, and modify this
+software for the following purposes only:
+
+- Personal use
+- Educational use
+- Research use
+- Non-commercial hobby use
+
+----------------------------------------------------------------
+Restrictions
+----------------------------------------------------------------
+
+The following uses are explicitly prohibited without prior
+written permission from the copyright holder:
+
+- Commercial use of any kind
+- Use in paid products, services, or subscriptions
+- Use as part of commercial AI systems or engines
+- Selling, licensing, or monetizing this software or derivatives
+- Redistribution without retaining this license text
+
+----------------------------------------------------------------
+AI-Specific Intent
+----------------------------------------------------------------
+
+TASO-Lite is intentionally designed to:
+
+- Not replace human decision-making
+- Not directly suggest best moves
+- Not maximize win-rate automatically
+- Preserve human agency in gameplay
+
+Any modification that removes these constraints must clearly
+state that it is a derived work and not the original TASO-Lite.
+
+----------------------------------------------------------------
+Disclaimer
+----------------------------------------------------------------
+
+This software is provided "AS IS", without warranty of any kind,
+express or implied, including but not limited to the warranties
+of merchantability, fitness for a particular purpose, and
+non-infringement.
+
+In no event shall the authors or copyright holders be liable
+for any claim, damages, or other liability, whether in an action
+of contract, tort, or otherwise, arising from, out of, or in
+connection with the software or the use or other dealings in
+the software.
+
+----------------------------------------------------------------
+Attribution
+----------------------------------------------------------------
+
+Any redistribution or public use of this software must include:
+
+- This license text
+- The name "TASO-Lite"
+- A clear statement that the software is non-commercial
+
+================================================================
+End of TASO-Lite Additional License Terms
+================================================================
