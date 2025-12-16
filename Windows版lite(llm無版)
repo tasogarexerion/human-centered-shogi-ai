@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+TASO-Lite Proxy for ShogiGUI (Windows, YaneuraOu)
+- USI proxy: ShogiGUI <-> YaneuraOu
+- Injects short "info string" only on golden triggers
+- Optional local LLM (llama.cpp) via taso_llm.py (<= 3 lines)
+
+Env (optional):
+  TASO_YANE_EXE=C:\path\to\YaneuraOu.exe   (default: ./YaneuraOu.exe)
+  TASO_SHOW=1|0                           (default: 1)
+  TASO_LLM=1|0                            (default: 1)
+  TASO_LLM_HELPER=.\taso_llm.py           (default: ./taso_llm.py)
+  TASO_LLM_TIMEOUT_SEC=0.8                (default: 0.8)
+  TASO_LLM_MODEL=C:\path\to\model.gguf    (required if TASO_LLM=1)
+  TASO_LLM_CLI=C:\path\to\llama-cli.exe   (optional; default: llama-cli in PATH)
+  TASO_OPENING_PLIES=20                   (default: 20)
+  TASO_OPENING_SPREAD=250                 (default: 250)
+  TASO_BUNKER_SPREAD=300                  (default: 300)
+  TASO_COMEBACK_CP=-600                   (default: -600)
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
+
+# ---------------------------
+# Settings
+# ---------------------------
+YANE_EXE = os.environ.get("TASO_YANE_EXE", os.path.join(os.getcwd(), "YaneuraOu.exe"))
+SHOW = os.environ.get("TASO_SHOW", "1") == "1"
+
+LLM_ENABLED = os.environ.get("TASO_LLM", "1") == "1"
+LLM_HELPER = os.environ.get("TASO_LLM_HELPER", os.path.join(os.getcwd(), "taso_llm.py"))
+LLM_TIMEOUT = float(os.environ.get("TASO_LLM_TIMEOUT_SEC", "0.8"))
+LLM_MODEL = os.environ.get("TASO_LLM_MODEL", "")
+
+OPENING_PLIES = int(os.environ.get("TASO_OPENING_PLIES", "20"))
+OPENING_SPREAD = int(os.environ.get("TASO_OPENING_SPREAD", "250"))
+BUNKER_SPREAD = int(os.environ.get("TASO_BUNKER_SPREAD", "300"))
+COMEBACK_CP = int(os.environ.get("TASO_COMEBACK_CP", "-600"))
+
+
+# ---------------------------
+# Debug/Logging (stderr + file) - does NOT affect USI stdout
+# ---------------------------
+LOG_ENABLED = os.environ.get("TASO_LOG", "1").strip() not in ("0", "false", "False", "no", "NO", "")
+LOG_TO_STDERR = os.environ.get("TASO_LOG_STDERR", "1").strip() not in ("0", "false", "False", "no", "NO", "")
+
+def _default_log_path() -> str:
+    try:
+        # When frozen (PyInstaller), sys.executable points to the .exe
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, "taso_debug.log")
+
+LOG_PATH = os.environ.get("TASO_LOG_PATH", _default_log_path())
+
+def _now_iso() -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+def debug_log(msg: str) -> None:
+    # Never write to stdout here (stdout is reserved for USI)
+    line = f"[{_now_iso()}] {msg}"
+    if LOG_TO_STDERR:
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    if LOG_ENABLED:
+        try:
+            os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def usi_print(s: str) -> None:
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+def say(s: str) -> None:
+    if SHOW:
+        usi_print(f"info string {s}")
+
+def llm_say_3lines(payload: Dict) -> None:
+    if not (SHOW and LLM_ENABLED):
+        return
+    if not (os.path.isfile(LLM_HELPER) and os.access(LLM_HELPER, os.X_OK) or os.path.isfile(LLM_HELPER)):
+        return
+    if not LLM_MODEL or not os.path.isfile(LLM_MODEL):
+        return
+
+    try:
+        cp = subprocess.run(
+            [sys.executable, LLM_HELPER],
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=LLM_TIMEOUT,
+            env={**os.environ, "TASO_LLM_MODEL": LLM_MODEL},
+        )
+        out = (cp.stdout or "").strip()
+        if not out:
+            return
+        for line in out.splitlines()[:3]:
+            line = line.strip()
+            if line:
+                usi_print(f"info string 🗣 {line}")
+    except Exception:
+        return
+
+def safe_int(x: str, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+# Parse helpers for USI info lines
+RE_DEPTH = re.compile(r"\bdepth\s+(\d+)\b")
+RE_MPV   = re.compile(r"\bmultipv\s+(\d+)\b")
+RE_CP    = re.compile(r"\bscore\s+cp\s+(-?\d+)\b")
+RE_MATE  = re.compile(r"\bscore\s+mate\s+(-?\d+)\b")
+
+@dataclass
+class InfoState:
+    # best known at max depth per multipv
+    d1: int = -1
+    cp1: Optional[int] = None
+    d2: int = -1
+    cp2: Optional[int] = None
+    mate_depth: int = -1
+    mate: Optional[int] = None
+
+    def spread(self) -> Optional[int]:
+        if self.cp1 is None or self.cp2 is None:
+            return None
+        return self.cp1 - self.cp2
+
+class TriggerState:
+    def __init__(self) -> None:
+        self.opening_mode = True
+        self.opening_fired = False
+        self.bunker_fired = False
+        self.comeback_fired = False
+        self.mate_fired = False
+
+    def reset_for_go(self, move_count: int) -> None:
+        self.opening_mode = move_count <= OPENING_PLIES
+        self.opening_fired = False
+        self.bunker_fired = False
+        self.comeback_fired = False
+        self.mate_fired = False
+
+# ---------------------------
+# Engine process + threads
+# ---------------------------
+class EngineProxy:
+    def __init__(self, exe: str) -> None:
+        self.exe = exe
+        self.proc = subprocess.Popen(
+            [exe],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        assert self.proc.stdin and self.proc.stdout
+        self._in = self.proc.stdin
+        self._out = self.proc.stdout
+
+        self.lock = threading.Lock()
+        self.info = InfoState()
+        self.trig = TriggerState()
+        self.move_count = 0
+
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+        # For “block until token” waits
+        self._token_cv = threading.Condition()
+        self._last_line: str = ""
+
+    def send(self, line: str) -> None:
+        with self.lock:
+            self._in.write(line + "\n")
+            self._in.flush()
+
+    def close(self) -> None:
+        try:
+            self.send("quit")
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+
+    def wait_for(self, prefix: str, timeout: float = 3.0) -> bool:
+        end = time.time() + timeout
+        with self._token_cv:
+            while time.time() < end:
+                if self._last_line.startswith(prefix):
+                    return True
+                remain = end - time.time()
+                self._token_cv.wait(timeout=max(0.05, min(0.2, remain)))
+        return False
+
+    def _handle_position(self, line: str) -> None:
+        # Count moves after "moves"
+        # position ... moves m1 m2 ...
+        parts = line.strip().split()
+        if "moves" in parts:
+            idx = parts.index("moves")
+            self.move_count = max(0, len(parts) - idx - 1)
+        else:
+            self.move_count = 0
+
+    def _reset_info_for_go(self) -> None:
+        self.info = InfoState()
+        self.trig.reset_for_go(self.move_count)
+
+    def _parse_info_line(self, line: str) -> None:
+        d = -1
+        m = RE_DEPTH.search(line)
+        if m:
+            d = safe_int(m.group(1), -1)
+        mpv = 1
+        m = RE_MPV.search(line)
+        if m:
+            mpv = safe_int(m.group(1), 1)
+
+        mcp = RE_CP.search(line)
+        if mcp:
+            cp = safe_int(mcp.group(1), 0)
+            if mpv == 1 and d >= self.info.d1:
+                self.info.d1 = d
+                self.info.cp1 = cp
+            elif mpv == 2 and d >= self.info.d2:
+                self.info.d2 = d
+                self.info.cp2 = cp
+
+        mm = RE_MATE.search(line)
+        if mm:
+            mate = safe_int(mm.group(1), 0)
+            if d >= self.info.mate_depth:
+                self.info.mate_depth = d
+                self.info.mate = mate
+
+    
+    def _emit_event(self, event: str, base_text: str, spread: Optional[int] = None) -> None:
+        # Show in ShogiGUI via USI info string (stdout) if enabled
+        if SHOW:
+            say(base_text)
+        # Also record to stderr + log file with move count (ply)
+        parts = [event, f"ply={self.move_count}"]
+        if self.info.depth is not None:
+            parts.append(f"depth={self.info.depth}")
+        if self.info.cp1 is not None:
+            parts.append(f"cp1={self.info.cp1}")
+        if self.info.cp2 is not None:
+            parts.append(f"cp2={self.info.cp2}")
+        if spread is not None:
+            parts.append(f"spread={spread}")
+        if self.info.mate is not None:
+            parts.append(f"mate={self.info.mate}")
+        debug_log(" | ".join(parts))
+
+    def _maybe_fire_triggers(self) -> None:
+        # Called after info parse updates
+        spread = self.info.spread()
+
+        # Opening break: early + spread big (once)
+        if self.trig.opening_mode and (not self.trig.opening_fired) and spread is not None and spread >= OPENING_SPREAD:
+            self.trig.opening_fired = True
+            self._emit_event('OPENING_BREAK', 'OPENING BREAK!', spread)
+            llm_say_3lines({
+                "event": "OPENING_BREAK",
+                "phase": "OPENING->MID",
+                "reason": "spread",
+                "move_count": self.move_count,
+                "spread": spread,
+                "cp1": self.info.cp1,
+                "cp2": self.info.cp2,
+            })
+
+        # BUNKER: spread big (once per go)
+        if (not self.trig.bunker_fired) and spread is not None and spread >= BUNKER_SPREAD:
+            self.trig.bunker_fired = True
+            self._emit_event('BUNKER', 'BUNKER', spread)
+            llm_say_3lines({
+                "event": "BUNKER",
+                "phase": "BUNKER",
+                "move_count": self.move_count,
+                "spread": spread,
+                "cp1": self.info.cp1,
+                "cp2": self.info.cp2,
+            })
+
+        # COMEBACK: pv1 cp very negative (once per go)
+        if (not self.trig.comeback_fired) and self.info.cp1 is not None and self.info.cp1 <= COMEBACK_CP:
+            self.trig.comeback_fired = True
+            self._emit_event('COMEBACK', 'COMEBACK', spread)
+            llm_say_3lines({
+                "event": "COMEBACK",
+                "phase": "COMEBACK",
+                "move_count": self.move_count,
+                "cp1": self.info.cp1,
+                "spread": spread,
+            })
+
+        # SUDDEN DEATH: mate appears (once per go)
+        if (not self.trig.mate_fired) and self.info.mate is not None:
+            self.trig.mate_fired = True
+            self._emit_event('MATE', 'SUDDEN DEATH' if (self.info.mate or 0) != 0 else 'MATE HINT', spread)
+            llm_say_3lines({
+                "event": "SUDDEN_DEATH" if (self.info.mate or 0) != 0 else "MATE_HINT",
+                "phase": "ENDGAME",
+                "move_count": self.move_count,
+                "mate": self.info.mate,
+                "cp1": self.info.cp1,
+                "spread": spread,
+            })
+
+    def _read_loop(self) -> None:
+        while True:
+            line = self._out.readline()
+            if not line:
+                break
+            line = line.rstrip("\n")
+
+            # expose for wait_for()
+            with self._token_cv:
+                self._last_line = line
+                self._token_cv.notify_all()
+
+            # Parse info for triggers (we do NOT change engine output)
+            if line.startswith("info "):
+                try:
+                    self._parse_info_line(line)
+                    self._maybe_fire_triggers()
+                except Exception:
+                    pass
+
+            # Forward engine line to GUI
+            usi_print(line)
+
+# ---------------------------
+# Main USI loop (GUI -> Proxy -> Engine)
+# ---------------------------
+def main() -> int:
+    if not os.path.isfile(YANE_EXE):
+        usi_print("id name TASO-Lite (ERROR: YaneuraOu.exe not found)")
+        usi_print("id author TASO")
+        usi_print("usiok")
+        # keep responding to not freeze GUI
+        for line in sys.stdin:
+            line = line.strip()
+            if line == "isready":
+                usi_print("readyok")
+            elif line == "quit":
+                return 0
+        return 0
+
+    eng = EngineProxy(YANE_EXE)
+
+    try:
+        for raw in sys.stdin:
+            line = raw.strip()
+            if not line:
+                continue
+
+            # Track position move count (for opening trigger)
+            if line.startswith("position "):
+                eng._handle_position(line)
+
+            if line == "usi":
+                eng.send(line)
+                # Just wait a bit; reader thread forwards everything including usiok
+                eng.wait_for("usiok", timeout=3.0)
+                continue
+
+            if line == "isready":
+                # Force MultiPV=2 for spread-based triggers
+                eng.send("setoption name MultiPV value 2")
+                eng.send(line)
+                eng.wait_for("readyok", timeout=3.0)
+                continue
+
+            if line.startswith("go"):
+                eng._reset_info_for_go()
+                eng.send(line)
+                continue
+
+            if line == "quit":
+                eng.send(line)
+                return 0
+
+            # passthrough
+            eng.send(line)
+
+    finally:
+        eng.close()
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
