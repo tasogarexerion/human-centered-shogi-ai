@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+taso_proxy_narrator.py
+
+Always-talking lightweight TASO narrator proxy.
+- Extremely lightweight (no LLM)
+- Always speaks when MPV1 & MPV2 are available
+- No mate, no ply, no opening phase
+- Commentary only (no judgement)
+"""
+
+import sys
+import subprocess
+import threading
+import queue
+import re
+import os
+
+# =========================
+# Config (env overridable)
+# =========================
+PREFIX = os.environ.get("TASO_PREFIX", "TASO:")
+MIN_DEPTH = int(os.environ.get("TASO_MIN_DEPTH", "8"))
+DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
+
+ENGINE_PATH = os.environ.get("TASO_ENGINE", "YaneuraOu.exe")
+ENGINE_ARGS = os.environ.get("TASO_ENGINE_ARGS", "").strip()
+
+# =========================
+# Utils
+# =========================
+def usi_print(line: str):
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+def say(msg: str):
+    usi_print(f"info string {PREFIX} {msg}")
+
+# =========================
+# Regex
+# =========================
+RE_DEPTH = re.compile(r"\bdepth\s+(\d+)\b")
+RE_MPV = re.compile(r"\bmultipv\s+(\d+)\b")
+RE_SCORE_CP = re.compile(r"\bscore\s+cp\s+(-?\d+)\b")
+RE_SCORE_MATE = re.compile(r"\bscore\s+mate\s+(-?\d+)\b")
+
+# =========================
+# State
+# =========================
+class PV:
+    def __init__(self):
+        self.depth = -1
+        self.cp = None
+
+class State:
+    def __init__(self):
+        self.pv1 = PV()
+        self.pv2 = PV()
+
+    def ready(self):
+        return self.pv1.cp is not None and self.pv2.cp is not None
+
+    def depth_eff(self):
+        return min(self.pv1.depth, self.pv2.depth)
+
+    def spread(self):
+        return abs(self.pv1.cp - self.pv2.cp)
+
+    def abs_cp(self):
+        return abs(self.pv1.cp)
+
+# =========================
+# Commentary logic
+# =========================
+def narrate(state: State):
+    sp = state.spread()
+    acp = state.abs_cp()
+
+    if sp < 80:
+        say("候補手が多く、まだ形が定まっていない")
+    elif sp < 200:
+        say("候補手が少しずつ絞られてきている")
+    elif sp < 400:
+        say("有力な手がかなり限定されてきた")
+    else:
+        say("選択肢が非常に限られている")
+
+    if acp < 200:
+        say("評価は揺れやすく、流れが変わりやすい")
+    elif acp < 600:
+        say("評価はまだ動きうる範囲")
+    else:
+        say("評価は比較的安定している")
+
+# =========================
+# Threads
+# =========================
+def pump_engine_stdout(proc, q):
+    for line in proc.stdout:
+        q.put(line)
+    q.put(None)
+
+def pump_gui_stdin(proc):
+    for line in sys.stdin:
+        proc.stdin.write(line)
+        proc.stdin.flush()
+
+# =========================
+# Main
+# =========================
+def main():
+    args = [ENGINE_PATH] + (ENGINE_ARGS.split() if ENGINE_ARGS else [])
+
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        universal_newlines=True,
+        bufsize=1,
+    )
+
+    q = queue.Queue()
+    threading.Thread(target=pump_engine_stdout, args=(proc, q), daemon=True).start()
+    threading.Thread(target=pump_gui_stdin, args=(proc,), daemon=True).start()
+
+    state = State()
+
+    while True:
+        raw = q.get()
+        if raw is None:
+            break
+
+        line = raw.rstrip("\r\n")
+        usi_print(line)
+
+        if not line.startswith("info "):
+            continue
+
+        if RE_SCORE_MATE.search(line):
+            continue
+
+        m_mpv = RE_MPV.search(line)
+        m_cp = RE_SCORE_CP.search(line)
+        m_d = RE_DEPTH.search(line)
+
+        if not (m_mpv and m_cp):
+            continue
+
+        mpv = int(m_mpv.group(1))
+        cp = int(m_cp.group(1))
+        depth = int(m_d.group(1)) if m_d else -1
+
+        if mpv == 1:
+            state.pv1.cp = cp
+            if depth >= 0:
+                state.pv1.depth = depth
+        elif mpv == 2:
+            state.pv2.cp = cp
+            if depth >= 0:
+                state.pv2.depth = depth
+        else:
+            continue
+
+        if not state.ready():
+            continue
+        if state.depth_eff() < MIN_DEPTH:
+            continue
+
+        narrate(state)
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
