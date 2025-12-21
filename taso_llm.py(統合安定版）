@@ -36,7 +36,10 @@ except Exception:
     sys.exit(0)
 
 phase = str(data.get("phase", "MIDGAME")).upper()
-rule = PHASE_RULES.get(phase, PHASE_RULES["MIDGAME"])
+if phase not in PHASE_RULES:
+    phase = "MIDGAME"
+
+rule = PHASE_RULES[phase]
 
 prompt = textwrap.dedent(f"""
 {PROMPT_BASE}
