@@ -399,21 +399,6 @@ while IFS= read -r line; do
     fi
   fi
 
- if [[ "$line" == position* ]]; then
-  CURRENT_POS="$line"
-  if [ "$TASO_USE_MOVECOUNT" = "1" ]; then
-    MOVE_COUNT="$(
-      echo "$line" | awk '{
-        for(i=1;i<=NF;i++){
-          if($i=="moves"){ print (NF - i); exit }
-        }
-        print 0
-      }'
-    )"
-  else
-    MOVE_COUNT=0
-  fi
-fi
 
   if [[ "$line" == usi* ]]; then
     if [ "$DUMMY_MODE" = "1" ]; then
