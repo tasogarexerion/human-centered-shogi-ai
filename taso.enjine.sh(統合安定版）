@@ -175,7 +175,14 @@ cleanup(){
 }
 trap cleanup EXIT INT TERM
 
-mate_num(){ [[ "${1:-}" =~ ^-?[0-9]+$ ]] && echo "$1" || echo "0"; }
+mate_num(){
+  # 数値のみ通す（負のmateも保持）
+  if [[ "${1:-}" =~ ^-?[0-9]+$ ]]; then
+    echo "$1"
+  else
+    echo "0"
+  fi
+}
 
 # Read until token from FD (no forwarding), with timeout/limit
 read_until_token_discard(){
@@ -325,9 +332,12 @@ emit_comeback(){
 
   if [ "$score" -le "$COMEBACK_CP" ]; then
     local type roadmap
-    if [ "$mate" -gt 0 ] && [ "$mate" -le 7 ]; then
-      type="☠⚡ COMEBACK 一撃必殺"
-      roadmap="詰めろ・必至が示唆される"
+    if [ "$mate" -lt 0 ]; then
+  type="☠🧱 即死警告"
+  roadmap="回避不能な詰み筋が示唆される"
+elif [ "$mate" -gt 0 ] && [ "$mate" -le 7 ]; then
+  type="☠⚡ COMEBACK 一撃必殺"
+  roadmap="詰めろ・必至が示唆される"
     else
       # sudden death gate
       if [ "$score" -le "$TASO_SD_SCORE_LIMIT" ] && [ "$mate" -eq 0 ]; then
