@@ -371,20 +371,21 @@ while IFS= read -r line; do
   dbg "IN: $line"
 
   if [[ "$line" == position* ]]; then
-    CURRENT_POS="${line#position }"
-    if [ "$TASO_USE_MOVECOUNT" = "1" ]; then
-      MOVE_COUNT="$(
-        echo "$line" | awk '{
-          for(i=1;i<=NF;i++){
-            if($i=="moves"){ print (NF - i); exit }
-          }
-          print 0
-        }' 2>/dev/null
-      )"
-    else
-      MOVE_COUNT=0
-    fi
+  # 生の position 行を保持（startpos / fen 両対応）
+  CURRENT_POS="$line"
+  if [ "$TASO_USE_MOVECOUNT" = "1" ]; then
+    MOVE_COUNT="$(
+      echo "$line" | awk '{
+        for(i=1;i<=NF;i++){
+          if($i=="moves"){ print (NF - i); exit }
+        }
+        print 0
+      }'
+    )"
+  else
+    MOVE_COUNT=0
   fi
+fi
 
   if [[ "$line" == usi* ]]; then
     if [ "$DUMMY_MODE" = "1" ]; then
