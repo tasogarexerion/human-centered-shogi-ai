@@ -32,13 +32,16 @@ estimate_hws() {
   local spread="${2:-0}"
 
   # awk の exp() を使う（macOS標準awkでOK）
-  awk -v cp="$cp1" -v sp="$spread" 'BEGIN{
-    # spread補正（効きすぎ防止にクリップ）
+  awk -v cp="$cp1" -v sp="$spread" -v mc="$MOVE_COUNT" 'BEGIN{
+    # spread補正（効きすぎ防止）
     if (sp > 800) sp = 800;
     if (sp < -800) sp = -800;
 
-    eff = cp + 0.30*sp;            # ここが“崖”の効き
-    x = eff / 450.0;               # 感度（小さいほど鋭い）
+    # 終盤ほど spread の影響を弱める
+    w = (mc > 80 ? 0.15 : 0.30);
+    eff = cp + w*sp;
+
+    x = eff / 450.0;
     h = 1.0 / (1.0 + exp(-x));
 
     # クリップ
