@@ -1,0 +1,85 @@
+cat > "$HOME/shogi/wrapper/taso_llm.py" <<'PY'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json, os, subprocess, sys, textwrap
+
+LLM_CLI = os.environ.get("TASO_LLM_CLI", "llama-cli")
+LLM_MODEL = os.environ.get("TASO_LLM_MODEL")
+TIMEOUT = float(os.environ.get("TASO_LLM_TIMEOUT_SEC", "0.8"))
+MAX_TOKENS = int(os.environ.get("TASO_LLM_MAX_TOKENS", "96"))
+TEMPERATURE = float(os.environ.get("TASO_LLM_TEMPERATURE", "0.2"))
+
+if not LLM_MODEL:
+    sys.exit(0)
+
+PROMPT_BASE = """
+あなたは将棋AI「TASO」の解説補助です。役割は【局面の翻訳】のみです。
+
+共通ルール：
+- 出力は最大3行
+- 断定しすぎない
+- 感情表現は禁止
+- 指示・命令は禁止
+- 「〜すると良い」ではなく「〜が示唆される」と表現する
+"""
+
+PHASE_RULES = {
+    "OPENING": "フェーズ：序盤\n- 助言は禁止\n- 状況の変化のみを1行で述べる\n",
+    "MIDGAME": "フェーズ：中盤\n- 危険・優先・禁止を述べる\n- 最大3行\n",
+    "ENDGAME": "フェーズ：終盤\n- 警告のみ\n- 原則1〜2行\n",
+}
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+phase = str(data.get("phase", "MIDGAME")).upper()
+rule = PHASE_RULES.get(phase, PHASE_RULES["MIDGAME"])
+
+prompt = textwrap.dedent(f"""
+{PROMPT_BASE}
+
+{rule}
+
+現在の局面データ（JSON）：
+{json.dumps(data, ensure_ascii=False, indent=2)}
+
+出力：
+""").strip()
+
+cmd = [
+    LLM_CLI,
+    "-m", LLM_MODEL,
+    "--temp", str(TEMPERATURE),
+    "--n-predict", str(MAX_TOKENS),
+    "--no-display-prompt",
+]
+
+try:
+    proc = subprocess.run(
+        cmd,
+        input=prompt,
+        text=True,
+        capture_output=True,
+        timeout=TIMEOUT,
+    )
+except subprocess.TimeoutExpired:
+    sys.exit(0)
+
+if proc.returncode != 0:
+    sys.exit(0)
+
+out = (proc.stdout or "").strip()
+if not out:
+    sys.exit(0)
+
+lines = [l.strip() for l in out.splitlines() if l.strip()][:3]
+
+MAX_CHARS = 120
+for l in lines:
+    print(l[:MAX_CHARS])
+PY
+
+chmod +x "$HOME/shogi/wrapper/taso_llm.py"
