@@ -223,7 +223,7 @@ preflight_analyze(){
   local cp1=0 cp2=0
   local best_d1=-1 best_d2=-1
 
-  echo "position $CURRENT_POS" >&7
+  echo "$CURRENT_POS" >&7
   echo "go movetime $PREFLIGHT_MS" >&7
 
   local out n=0
@@ -380,8 +380,7 @@ PY
 while IFS= read -r line; do
   dbg "IN: $line"
 
-  if [[ "$line" == position* ]]; then
-  # 生の position 行を保持（startpos / fen 両対応）
+ if [[ "$line" == position* ]]; then
   CURRENT_POS="$line"
   if [ "$TASO_USE_MOVECOUNT" = "1" ]; then
     MOVE_COUNT="$(
