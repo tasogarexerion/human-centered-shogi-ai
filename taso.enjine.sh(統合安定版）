@@ -16,6 +16,81 @@ TASO_LOG="${TASO_LOG:-1}"              # 1 => CSV log
 TASO_MIRACLE="${TASO_MIRACLE:-0}"      # 1 => even if mate seen, don't switch policy
 TASO_USE_MOVECOUNT="${TASO_USE_MOVECOUNT:-1}"  # 0 => don't use MOVE_COUNT thresholds
 
+# ========= HumanScore mode =========
+# auto: inferが使えればinfer、無理なら推定
+# infer: infer固定（失敗時は0.50）
+# estimate: 推定固定（infer使わない）
+# off: 常に0.50（表示だけ欲しい人向け）
+TASO_HWS_MODE="${TASO_HWS_MODE:-auto}"
+
+# ========= HumanScore (infer or estimate) =========
+estimate_hws() {
+  # 推定HumanScore（0.01〜0.99）
+  # 基本：cp1（先手視点の符号のまま）をシグモイド変換
+  # 補正：spread（cp1-cp2）が大きいほど「人間的に分かりやすい」=勝率を少し上げる
+  local cp1="${1:-0}"
+  local spread="${2:-0}"
+
+  # awk の exp() を使う（macOS標準awkでOK）
+  awk -v cp="$cp1" -v sp="$spread" 'BEGIN{
+    # spread補正（効きすぎ防止にクリップ）
+    if (sp > 800) sp = 800;
+    if (sp < -800) sp = -800;
+
+    eff = cp + 0.30*sp;            # ここが“崖”の効き
+    x = eff / 450.0;               # 感度（小さいほど鋭い）
+    h = 1.0 / (1.0 + exp(-x));
+
+    # クリップ
+    if (h < 0.01) h = 0.01;
+    if (h > 0.99) h = 0.99;
+
+    printf "%.2f\n", h;
+  }'
+}
+
+get_hws() {
+  local cp="${1:-0}" spread="${2:-0}"
+
+  case "$TASO_HWS_MODE" in
+    off)
+      echo "0.50"
+      return 0
+      ;;
+    estimate)
+      estimate_hws "$cp" "$spread"
+      return 0
+      ;;
+    infer|auto)
+      ;;
+    *)
+      # 不明値はauto扱い
+      ;;
+  esac
+
+  # infer が使えるなら使う（auto/infer）
+  if [ "$TASO_HWS_MODE" != "estimate" ] \
+     && [ -n "$CURRENT_POS" ] \
+     && [ -f "$HUMAN_AI" ] \
+     && [ -x "$HUMAN_PY" ]; then
+    local out
+    out="$("$HUMAN_PY" "$HUMAN_AI" "$CURRENT_POS" "$cp" "$spread" 2>/dev/null || true)"
+    # 妥当な数値っぽい時だけ採用
+    if echo "$out" | awk 'BEGIN{ok=0} /^[0-9]+\.[0-9]+$/ { if($1>=0 && $1<=1) ok=1 } END{exit(ok?0:1)}'; then
+      echo "$out"
+      return 0
+    fi
+    # infer失敗 → autoなら推定、infer固定なら0.50
+    if [ "$TASO_HWS_MODE" = "infer" ]; then
+      echo "0.50"
+      return 0
+    fi
+  fi
+
+  # auto fallback
+  estimate_hws "$cp" "$spread"
+}
+
 # ========= Timing / safety =========
 PREFLIGHT_MS="${PREFLIGHT_MS:-30}"     # 20-50ms recommended
 ENGINE_READ_TIMEOUT="${ENGINE_READ_TIMEOUT:-2}"
@@ -113,15 +188,6 @@ read_until_token_discard(){
   return 1
 }
 
-# ========= HumanScore =========
-get_hws(){
-  local cp="${1:-0}" spread="${2:-0}"
-  if [ -n "$CURRENT_POS" ] && [ -f "$HUMAN_AI" ] && [ -x "$HUMAN_PY" ]; then
-    "$HUMAN_PY" "$HUMAN_AI" "$CURRENT_POS" "$cp" "$spread" 2>/dev/null || echo "0.50"
-  else
-    echo "0.50"
-  fi
-}
 
 # ========= bunker =========
 bunker_flag(){
