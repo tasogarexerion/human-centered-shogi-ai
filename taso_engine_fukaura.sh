@@ -2,18 +2,27 @@ cat > ~/shogi/wrapper/taso_engine_fukaura.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==========================
-# TASO Engine — FUKAURAOU ONLY (32GB SAFE)
-# USI wrapper + HumanScore(estimate)
-# ==========================
+# =========================================================
+# TASO Engine — FUKAURAOU ONLY (Mac / 32GB SAFE / 嫌らしさ増し完成版)
+#
+# 思想（このチャット継承）：
+#  - HumanScoreはestimateのみ（軽い・安定）
+#  - エンジン1基（ふかうら王）でMultiPVを最大depthスナップショット取得
+#  - 優勢：人間が維持しやすい手（収束=robust + 長いprefix=迷いにくい）
+#  - 劣勢：人間殺し（擬似一本道破壊=初手一致→2手目分岐 + 早分岐 + 適度drop）
+#  - BUNKER：spread大きい局面は安定寄せ
+#  - COMEBACK：悪い＋HWS低い → 事故誘発寄り
+#  - SUDDEN DEATH：一定以下 → MultiPV抽選強制
+# =========================================================
 
+# --------------------------
+# toggles / paths
+# --------------------------
 TASO_SHOW="${TASO_SHOW:-1}"
-ENGINE_READ_TIMEOUT="${ENGINE_READ_TIMEOUT:-2}"
-
-# ★ここを実際のふかうら王に
-FUKA_BIN="${FUKA_BIN:-__PUT_FUKAURAOU_PATH_HERE__}"
+FUKA_BIN="${FUKA_BIN:-/Users/taso/shogi/engines/fukauraou/fukauraou}"
 
 say(){ [ "$TASO_SHOW" = "1" ] && echo "info string $*"; }
+is_num(){ [[ "${1:-}" =~ ^-?[0-9]+$ ]]; }
 
 estimate_hws(){
   awk -v cp="${1:-0}" 'BEGIN{
@@ -25,6 +34,49 @@ estimate_hws(){
   }'
 }
 
+# --------------------------
+# thresholds (cp is adjusted to side-to-move)
+# --------------------------
+TASO_WIN_CP="${TASO_WIN_CP:-300}"
+TASO_LOSE_CP="${TASO_LOSE_CP:--300}"
+COMEBACK_CP="${COMEBACK_CP:--600}"
+
+# SUDDEN DEATH (super-losing chaos)
+SUDDEN_DEATH_MODE=0
+TASO_SD_SCORE_LIMIT="${TASO_SD_SCORE_LIMIT:--650}"
+TASO_SD_MPV_MIN="${TASO_SD_MPV_MIN:-2}"
+TASO_SD_MPV_MAX="${TASO_SD_MPV_MAX:-3}"
+
+# MultiPV / engine defaults (32GB safe)
+TASO_MULTIPV="${TASO_MULTIPV:-3}"
+TASO_THREADS="${TASO_THREADS:-8}"
+TASO_HASH_MB="${TASO_HASH_MB:-1024}"
+
+# BUNKER: spread = cp1 - cp2
+BUNKER_SPREAD="${BUNKER_SPREAD:-300}"
+
+# WIN: stable winning selector
+TASO_STABLE_MPV_MIN="${TASO_STABLE_MPV_MIN:-1}"
+TASO_STABLE_MPV_MAX="${TASO_STABLE_MPV_MAX:-3}"
+TASO_STABLE_DROP="${TASO_STABLE_DROP:-80}"   # allow small degrade from PV1
+TASO_PREFIX_K="${TASO_PREFIX_K:-4}"          # pv prefix compare length
+
+# LOSE: annoying selector
+TASO_ANNOY_MPV_MIN="${TASO_ANNOY_MPV_MIN:-2}"
+TASO_ANNOY_MPV_MAX="${TASO_ANNOY_MPV_MAX:-3}"
+TASO_ANNOY_MAX_DROP="${TASO_ANNOY_MAX_DROP:-180}"
+
+# "嫌らしさ" knobs (bigger = more evil)
+TASO_EVIL_MODE="${TASO_EVIL_MODE:-1}"                # 0 => disable evil scoring, fallback to early-diverge random
+TASO_EVIL_FAKE_CONV_BONUS="${TASO_EVIL_FAKE_CONV_BONUS:-18}"  # prefix>=1 (same first move) bonus
+TASO_EVIL_EARLY_DIVERGE_W="${TASO_EVIL_EARLY_DIVERGE_W:-10}"  # weight for (K - prefix)
+TASO_EVIL_MID_DROP_BONUS="${TASO_EVIL_MID_DROP_BONUS:-10}"    # drop in [40,120]
+TASO_EVIL_MID_DROP_MIN="${TASO_EVIL_MID_DROP_MIN:-40}"
+TASO_EVIL_MID_DROP_MAX="${TASO_EVIL_MID_DROP_MAX:-120}"
+
+# --------------------------
+# startup checks
+# --------------------------
 if [ ! -x "$FUKA_BIN" ]; then
   echo "id name TASO (fukauraou missing)"
   echo "id author taso"
@@ -32,22 +84,292 @@ if [ ! -x "$FUKA_BIN" ]; then
   exit 0
 fi
 
+# --------------------------
+# start engine
+# --------------------------
 coproc ENG { "$FUKA_BIN"; }
 exec 3>&"${ENG[1]}" 4<"${ENG[0]}"
+trap 'echo quit >&3 2>/dev/null || true' EXIT INT TERM
 
-cleanup(){ echo quit >&3 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
-
+# --------------------------
+# state
+# --------------------------
 CURRENT_POS=""
-TURN_SIGN=1   # +1:先手 / -1:後手
+TURN_SIGN=1
+HAVE_POS=0
+LAST_SCORE=0
+LAST_MATE=""
 
+# PV snapshot at max depth for each mpv
+declare -A PV_MOVE PV_CP PV_MATE PV_DEPTH PV_PVLINE
+
+reset_pv(){
+  PV_MOVE=(); PV_CP=(); PV_MATE=(); PV_DEPTH=(); PV_PVLINE=()
+}
+
+apply_forced_options(){
+  echo "setoption name Threads value $TASO_THREADS" >&3 || true
+  echo "setoption name Hash value $TASO_HASH_MB" >&3 || true
+  echo "setoption name MultiPV value $TASO_MULTIPV" >&3 || true
+}
+
+# --------------------------
+# helpers
+# --------------------------
+bunker_flag(){
+  local cp1="${1:-0}" cp2="${2:-0}"
+  local sp=$((cp1 - cp2))
+  if (( sp >= BUNKER_SPREAD )); then
+    echo "1 $sp"
+  else
+    echo "0 $sp"
+  fi
+}
+
+common_prefix_len(){
+  local a="$1" b="$2" k="$3"
+  awk -v A="$a" -v B="$b" -v K="$k" 'BEGIN{
+    n=split(A,aa," "); m=split(B,bb," ");
+    lim=K; if(n<lim) lim=n; if(m<lim) lim=m;
+    c=0;
+    for(i=1;i<=lim;i++){
+      if(aa[i]==bb[i]) c++;
+      else break;
+    }
+    print c;
+  }'
+}
+
+# drop-limited random pick from mpv range
+pick_from_range_with_drop(){
+  local min="$1" max="$2" cp1="$3" limit="$4"
+  local choices=() i
+  for i in $(seq "$min" "$max"); do
+    local mv="${PV_MOVE[$i]:-}"
+    local cp="${PV_CP[$i]:-}"
+    [ -n "$mv" ] || continue
+    is_num "$cp" || continue
+    local drop=$(( cp1 - cp ))
+    if (( drop <= limit )); then
+      choices+=("$mv")
+    fi
+  done
+  if [ "${#choices[@]}" -gt 0 ]; then
+    echo "${choices[$((RANDOM % ${#choices[@]}))]}"
+  else
+    echo ""
+  fi
+}
+
+emit_comeback_and_sd(){
+  local cp1="$1" mate1="${2:-}" hws="$3"
+  SUDDEN_DEATH_MODE=0
+  [ -n "$mate1" ] && return 0
+
+  if (( cp1 <= TASO_SD_SCORE_LIMIT )); then
+    SUDDEN_DEATH_MODE=1
+    say "☠🎯 SUDDEN DEATH: 崩れ筋狙い"
+    return 0
+  fi
+
+  if (( cp1 <= COMEBACK_CP )); then
+    awk -v h="$hws" 'BEGIN{exit(!(h<0.45))}' && say "☠🎭 COMEBACK: 事故誘発寄り" || say "☠🐍 COMEBACK: ジワ粘り"
+  fi
+}
+
+# --------------------------
+# move selectors
+# --------------------------
+
+# WIN selector: robust (convergent) + long prefix (easy)
+pick_stable_winning_move(){
+  local cp1="${PV_CP[1]:-0}"
+  local mv1="${PV_MOVE[1]:-}"
+  local pv1="${PV_PVLINE[1]:-}"
+  [ -n "$mv1" ] || { echo ""; return 0; }
+
+  # mate -> PV1
+  [ -n "${PV_MATE[1]:-}" ] && { echo "$mv1"; return 0; }
+
+  local min="$TASO_STABLE_MPV_MIN"
+  local max="$TASO_STABLE_MPV_MAX"
+
+  # votes by same first move; tie-breaker by drop then prefix
+  declare -A VOTES BESTDROP BESTPREF
+  local i
+  for i in $(seq "$min" "$max"); do
+    local mv="${PV_MOVE[$i]:-}"
+    local cp="${PV_CP[$i]:-}"
+    local pv="${PV_PVLINE[$i]:-}"
+    [ -n "$mv" ] || continue
+    is_num "$cp" || continue
+
+    local drop=$(( cp1 - cp ))
+    (( drop < 0 )) && drop=0
+    (( drop <= TASO_STABLE_DROP )) || continue
+
+    VOTES["$mv"]=$(( ${VOTES["$mv"]:-0} + 1 ))
+
+    local bd="${BESTDROP["$mv"]:-999999}"
+    if (( drop < bd )); then BESTDROP["$mv"]="$drop"; fi
+
+    local pref=0
+    if [ -n "$pv1" ] && [ -n "$pv" ]; then
+      pref="$(common_prefix_len "$pv1" "$pv" "$TASO_PREFIX_K")"
+    fi
+    local bp="${BESTPREF["$mv"]:-0}"
+    if (( pref > bp )); then BESTPREF["$mv"]="$pref"; fi
+  done
+
+  local best="$mv1"
+  local best_votes=-1 best_drop=999999 best_pref=-1
+  local mv
+  for mv in "${!VOTES[@]}"; do
+    local v="${VOTES["$mv"]}"
+    local d="${BESTDROP["$mv"]:-999999}"
+    local p="${BESTPREF["$mv"]:-0}"
+    if (( v > best_votes )) || { (( v == best_votes )) && (( d < best_drop )); } || { (( v == best_votes )) && (( d == best_drop )) && (( p > best_pref )); }; then
+      best="$mv"
+      best_votes="$v"
+      best_drop="$d"
+      best_pref="$p"
+    fi
+  done
+
+  echo "$best"
+}
+
+# LOSE selector: evil scoring
+pick_annoying_losing_move(){
+  local cp1="${PV_CP[1]:-0}"
+  local mv1="${PV_MOVE[1]:-}"
+  local pv1="${PV_PVLINE[1]:-}"
+  [ -n "$mv1" ] || { echo ""; return 0; }
+
+  # mate -> PV1
+  [ -n "${PV_MATE[1]:-}" ] && { echo "$mv1"; return 0; }
+
+  local min="$TASO_ANNOY_MPV_MIN"
+  local max="$TASO_ANNOY_MPV_MAX"
+
+  # fallback: early-diverge minimal prefix, random tie
+  if (( TASO_EVIL_MODE == 0 )); then
+    local best_pref=999999
+    local candidates=() i
+    for i in $(seq "$min" "$max"); do
+      local mv="${PV_MOVE[$i]:-}" cp="${PV_CP[$i]:-}" pv="${PV_PVLINE[$i]:-}"
+      [ -n "$mv" ] || continue
+      is_num "$cp" || continue
+      local drop=$(( cp1 - cp ))
+      (( drop <= TASO_ANNOY_MAX_DROP )) || continue
+      local pref=0
+      [ -n "$pv1" ] && [ -n "$pv" ] && pref="$(common_prefix_len "$pv1" "$pv" "$TASO_PREFIX_K")"
+      if (( pref < best_pref )); then best_pref="$pref"; candidates=("$mv")
+      elif (( pref == best_pref )); then candidates+=("$mv"); fi
+    done
+    [ "${#candidates[@]}" -gt 0 ] && echo "${candidates[$((RANDOM % ${#candidates[@]}))]}" || echo "$mv1"
+    return 0
+  fi
+
+  # evil scoring
+  local best_score=-999999
+  local candidates=() i
+  for i in $(seq "$min" "$max"); do
+    local mv="${PV_MOVE[$i]:-}"
+    local cp="${PV_CP[$i]:-}"
+    local pv="${PV_PVLINE[$i]:-}"
+    [ -n "$mv" ] || continue
+    is_num "$cp" || continue
+
+    local drop=$(( cp1 - cp ))
+    (( drop <= TASO_ANNOY_MAX_DROP )) || continue
+
+    local pref=0
+    if [ -n "$pv1" ] && [ -n "$pv" ]; then
+      pref="$(common_prefix_len "$pv1" "$pv" "$TASO_PREFIX_K")"
+    fi
+
+    # ---- evil score ----
+    # (1) earlier diverge is evil: (K - pref)*W
+    local score=$(( (TASO_PREFIX_K - pref) * TASO_EVIL_EARLY_DIVERGE_W ))
+
+    # (2) fake convergence: same first move then diverge later (pref>=1) is extra evil
+    if (( pref >= 1 )); then
+      score=$(( score + TASO_EVIL_FAKE_CONV_BONUS ))
+    fi
+
+    # (3) mid-drop zone: "looks playable" but actually hard
+    if (( drop >= TASO_EVIL_MID_DROP_MIN && drop <= TASO_EVIL_MID_DROP_MAX )); then
+      score=$(( score + TASO_EVIL_MID_DROP_BONUS ))
+    fi
+
+    # choose max score, random tie
+    if (( score > best_score )); then
+      best_score="$score"
+      candidates=("$mv")
+    elif (( score == best_score )); then
+      candidates+=("$mv")
+    fi
+  done
+
+  if [ "${#candidates[@]}" -gt 0 ]; then
+    echo "${candidates[$((RANDOM % ${#candidates[@]}))]}"
+  else
+    echo "$mv1"
+  fi
+}
+
+pick_override_bestmove(){
+  local mv1="${PV_MOVE[1]:-}"
+  [ -n "$mv1" ] || { echo ""; return 0; }
+
+  local cp1="${PV_CP[1]:-0}"
+  local cp2="${PV_CP[2]:-$cp1}"
+  local mate1="${PV_MATE[1]:-}"
+
+  # mate -> PV1
+  [ -n "$mate1" ] && { echo "$mv1"; return 0; }
+
+  read bunker spread < <(bunker_flag "$cp1" "$cp2")
+
+  # SD: chaos from mpv range (no drop limit)
+  if (( SUDDEN_DEATH_MODE == 1 )); then
+    local pick
+    pick="$(pick_from_range_with_drop "$TASO_SD_MPV_MIN" "$TASO_SD_MPV_MAX" "$cp1" 999999)"
+    [ -n "$pick" ] && { echo "$pick"; return 0; }
+    echo "$mv1"; return 0
+  fi
+
+  # WIN: stable winning
+  if (( cp1 >= TASO_WIN_CP )); then
+    echo "$(pick_stable_winning_move)"; return 0
+  fi
+
+  # BUNKER: prefer robust stable even if not winning
+  if (( bunker == 1 )); then
+    echo "$(pick_stable_winning_move)"; return 0
+  fi
+
+  # LOSE: annoying
+  if (( cp1 <= TASO_LOSE_CP )); then
+    echo "$(pick_annoying_losing_move)"; return 0
+  fi
+
+  # otherwise PV1
+  echo "$mv1"
+}
+
+# =========================================================
+# USI main loop
+# =========================================================
 while IFS= read -r line; do
 
   if [[ "$line" == position* ]]; then
     CURRENT_POS="$line"
-    # moves数で手番判定
-    moves="$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="moves"){print NF-i; exit} print 0}')"
-    if (( moves % 2 == 0 )); then TURN_SIGN=1; else TURN_SIGN=-1; fi
+    HAVE_POS=1
+    # startpos moves ... で手番判定（moves数の偶奇）
+    mc="$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="moves"){print NF-i; exit} print 0}')"
+    (( mc % 2 == 0 )) && TURN_SIGN=1 || TURN_SIGN=-1
     echo "$line" >&3
     continue
   fi
@@ -58,6 +380,7 @@ while IFS= read -r line; do
       echo "$o"
       [[ "$o" == usiok* ]] && break
     done
+    apply_forced_options
     continue
   fi
 
@@ -70,24 +393,62 @@ while IFS= read -r line; do
     continue
   fi
 
-  if [[ "$line" == setoption* ]] || [[ "$line" == usinewgame* ]]; then
+  if [[ "$line" == setoption* ]]; then
+    # GUIのsetoptionは殺さない
     echo "$line" >&3
     continue
   fi
 
+  if [[ "$line" == usinewgame* ]]; then
+    echo "$line" >&3
+    apply_forced_options
+    continue
+  fi
+
   if [[ "$line" == go* ]]; then
+    reset_pv
     echo "$line" >&3
 
-    best_cp="0"
     bestmove_line="bestmove resign"
 
+    # collect until bestmove; track max-depth snapshot per mpv
     while IFS= read -r o <&4; do
       if [[ "$o" == info* ]]; then
         echo "$o"
+
+        mpv="$(echo "$o" | awk '{for(i=1;i<=NF;i++) if($i=="multipv"){print $(i+1); exit}}')"
+        [ -n "${mpv:-}" ] || mpv="1"
+
+        depth="$(echo "$o" | awk '{for(i=1;i<=NF;i++) if($i=="depth"){print $(i+1); exit}}')"
+        [[ "${depth:-}" =~ ^[0-9]+$ ]] || depth=0
+
+        prev="${PV_DEPTH[$mpv]:-0}"
+        (( depth >= prev )) || continue
+        PV_DEPTH["$mpv"]="$depth"
+
+        if [[ "$o" == *" pv "* ]]; then
+          pvline="$(echo "$o" | sed 's/.* pv //')"
+          PV_PVLINE["$mpv"]="$pvline"
+          pv1="$(echo "$pvline" | awk '{print $1}')"
+          [ -n "$pv1" ] && PV_MOVE["$mpv"]="$pv1"
+        fi
+
         if [[ "$o" == *"score cp"* ]]; then
           cp="$(echo "$o" | sed 's/.*score cp //' | awk '{print $1}')"
-          best_cp="$cp"
+          if is_num "$cp"; then
+            if (( HAVE_POS == 1 )); then
+              PV_CP["$mpv"]=$(( cp * TURN_SIGN ))
+            else
+              PV_CP["$mpv"]="$cp"
+            fi
+          fi
         fi
+
+        if [[ "$o" == *" mate "* ]]; then
+          mt="$(echo "$o" | sed 's/.* mate //' | awk '{print $1}')"
+          [ -n "$mt" ] && PV_MATE["$mpv"]="$mt"
+        fi
+
         continue
       fi
 
@@ -97,11 +458,34 @@ while IFS= read -r line; do
       fi
     done
 
-    # 手番補正
-    adj_cp=$(( best_cp * TURN_SIGN ))
-    HWS="$(estimate_hws "$adj_cp")"
-    say "🧠 人間勝率: $HWS (cp=$adj_cp)"
-    echo "$bestmove_line"
+    cp1="${PV_CP[1]:-0}"
+    cp2="${PV_CP[2]:-$cp1}"
+    mate1="${PV_MATE[1]:-}"
+
+    HWS="$(estimate_hws "$cp1")"
+    say "🧠 人間勝率: $HWS (cp=$cp1)"
+
+    emit_comeback_and_sd "$cp1" "$mate1" "$HWS"
+
+    override="$(pick_override_bestmove)"
+    if [ -n "$override" ]; then
+      if (( SUDDEN_DEATH_MODE == 1 )); then
+        say "☠🎯 SD: MultiPV抽選"
+      elif (( cp1 >= TASO_WIN_CP )); then
+        say "🛡 優勢: 収束＋prefix（人間向け安定勝ち）"
+      elif (( cp1 <= TASO_LOSE_CP )); then
+        say "🐍 劣勢: 嫌らしさ増し（擬似一本道破壊＋早分岐）"
+      else
+        read bunker spread < <(bunker_flag "$cp1" "$cp2")
+        (( bunker == 1 )) && say "🏖 バンカー: 安定寄せ(spread=$spread)"
+      fi
+      echo "bestmove $override"
+      LAST_SCORE="$cp1"
+      LAST_MATE="$mate1"
+    else
+      echo "$bestmove_line"
+    fi
+
     continue
   fi
 
